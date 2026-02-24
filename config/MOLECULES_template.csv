@@ -1,2 +1,0 @@
-molecule_id,display_name,type,mechanism_class,status,active
-EXAMPLE_MOL,Example Molecule,peptide,example_class,active,TRUE
