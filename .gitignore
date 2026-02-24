@@ -1,0 +1,7 @@
+__pycache__/
+.env
+*.json
+*.flag
+_state_pubmed_master/
+*.xlsx
+credentials.json
