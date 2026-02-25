@@ -598,6 +598,38 @@ def main():
         TIMEOUT_S=TIMEOUT_S,
     )
 
+    CONFIG_MODE = os.getenv("CONFIG_MODE", "google").strip().lower()  # google | local
+LOCAL_CONFIG_DIR = os.getenv("LOCAL_CONFIG_DIR", ".").strip()
+
+def load_molecules_and_rules_local(config_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    mol_path = os.path.join(config_dir, "MOLECULES.csv")
+    rules_path = os.path.join(config_dir, "SEARCH_RULES.csv")
+    if not os.path.exists(mol_path):
+        raise FileNotFoundError(f"Missing {mol_path}")
+    if not os.path.exists(rules_path):
+        raise FileNotFoundError(f"Missing {rules_path}")
+
+    mol = pd.read_csv(mol_path)
+    rules = pd.read_csv(rules_path)
+
+    mol["molecule_id"] = mol["molecule_id"].astype(str).str.strip()
+    rules["molecule_id"] = rules["molecule_id"].astype(str).str.strip()
+    rules["rule_id"] = rules["rule_id"].astype(str).str.strip()
+    rules["match_strength"] = rules["match_strength"].astype(str).str.strip().str.lower()
+    rules["query_string"] = rules["query_string"].astype(str).str.strip()
+
+    if "active" in mol.columns:
+        mol = mol[mol["active"].apply(_truthy)]
+    if "active" in rules.columns:
+        rules = rules[rules["active"].apply(_truthy)]
+
+    mol_ids = set(mol["molecule_id"].tolist())
+    rules = rules[rules["molecule_id"].isin(mol_ids)].copy()
+    return mol, rules
+
+if CONFIG_MODE == "local":
+    mol_df, rules_df = load_molecules_and_rules_local(LOCAL_CONFIG_DIR)
+else:
     mol_df, rules_df = load_molecules_and_rules(gc, CONFIG_SHEET_NAME)
 
     mol_type_map = {str(r.get("molecule_id","")).strip(): str(r.get("type","peptide")) for _, r in mol_df.iterrows()}
