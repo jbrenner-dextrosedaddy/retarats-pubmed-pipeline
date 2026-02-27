@@ -2,29 +2,34 @@
 """
 RetaRats PubMed Pipeline (script-friendly)
 
-What changed vs. the Colab export:
-- Removed Colab-only imports (google.colab) and notebook magics (!pip).
-- Uses Application Default Credentials for Google APIs:
-    - Local: GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json
-    - Or: gcloud auth application-default login (if you have gcloud set up)
-- Reads NCBI + config settings from environment variables.
+Runs as a normal Python script (no Colab magics).
+
+Config sources:
+- CONFIG_MODE="local"  -> reads config/MOLECULES.csv + config/SEARCH_RULES.csv
+- CONFIG_MODE="google" -> reads Google Sheet named CONFIG_SHEET_NAME with tabs MOLECULES + SEARCH_RULES
+
+Google auth:
+- Uses Application Default Credentials (ADC) for Sheets + Drive APIs.
 
 Required env vars:
-- CONFIG_SHEET_NAME   (default: "Moleculessearch")
-- NCBI_EMAIL          (required)
-- NCBI_API_KEY        (optional but recommended)
+- NCBI_EMAIL (required)
+- CONFIG_MODE (default: "local")
+- LOCAL_CONFIG_DIR (default: "config") when CONFIG_MODE="local"
 
 Optional env vars:
-- NCBI_TOOL           (default: "retarats_pubmed_bot")
-- DRIVE_FOLDER_PATH   (default: "My Drive/Retarats")
-- OUTPUT_BASE_NAME    (default: "RetaRats_PubMed")
-- RUN_MODE            (default: "AUTO")  # AUTO, BACKFILL_ONLY, DAILY_ONLY
-- DEFAULT_START_YEAR  (default: 2000)
-- DEFAULT_DAILY_DAYS  (default: 1)
+- NCBI_API_KEY (recommended)
+- CONFIG_SHEET_NAME (default: "Moleculessearch") when CONFIG_MODE="google"
+- NCBI_TOOL (default: "retarats_pubmed_bot")
+- DRIVE_FOLDER_PATH (default: "My Drive/Retarats")
+- OUTPUT_BASE_NAME (default: "RetaRats_PubMed")
+- RUN_MODE (default: "AUTO")  # AUTO, BACKFILL_ONLY, DAILY_ONLY
+- DEFAULT_START_YEAR (default: 2000)
+- DEFAULT_DAILY_DAYS (default: 1)
 """
 
 import os, json, time, random, re, hashlib, datetime as dt
 from typing import List, Tuple
+
 import requests
 import pandas as pd
 
@@ -40,6 +45,7 @@ from requests.exceptions import (
 )
 from urllib3.exceptions import ProtocolError
 
+
 # =========================
 # Defaults / env
 # =========================
@@ -49,7 +55,10 @@ NCBI_TOOL  = os.getenv("NCBI_TOOL", "retarats_pubmed_bot")
 NCBI_EMAIL = os.getenv("NCBI_EMAIL", "").strip()
 NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
 
+CONFIG_MODE = os.getenv("CONFIG_MODE", "local").strip().lower()  # local | google
+LOCAL_CONFIG_DIR = os.getenv("LOCAL_CONFIG_DIR", "config").strip()
 CONFIG_SHEET_NAME = os.getenv("CONFIG_SHEET_NAME", "Moleculessearch").strip()
+
 DRIVE_FOLDER_PATH = os.getenv("DRIVE_FOLDER_PATH", "My Drive/Retarats").strip()
 OUTPUT_BASE_NAME  = os.getenv("OUTPUT_BASE_NAME", "RetaRats_PubMed").strip()
 
@@ -67,14 +76,7 @@ TIMEOUT_S    = 60
 # Sheets append chunking
 APPEND_CHUNK_SIZE = 250
 
-# Stats rebuild toggle
-REBUILD_STATS_EVERY_RUN = True
-
-# Quality thresholds
-EXPLODE_YEAR_THRESHOLD  = 5000
-EXPLODE_TOTAL_THRESHOLD = 20000
-ZERO_HIT_FLAG = True
-
+# Output schema
 MASTER_COLUMNS = [
     "pmid",
     "molecule_id",
@@ -102,15 +104,14 @@ TAB_MASTER   = "PAPERS_MASTER"
 TAB_STATS    = "STATS"
 TAB_QUALITY  = "QUALITY_ALERTS"
 
+
 # =========================
 # Google auth (ADC)
 # =========================
 def google_clients():
     """
-    Uses Application Default Credentials.
-    Make sure your credentials have:
-      - Google Sheets API access
-      - Google Drive API access
+    Uses Application Default Credentials (ADC).
+    Needs Sheets + Drive scopes.
     """
     creds, _ = default(scopes=[
         "https://www.googleapis.com/auth/spreadsheets",
@@ -120,13 +121,13 @@ def google_clients():
     drive_service = build("drive", "v3", credentials=creds)
     return creds, gc, drive_service
 
+
 # =========================
-# Drive helpers (place sheets in folder)
+# Drive helpers
 # =========================
 def _get_drive_folder_id(drive_service, folder_path: str) -> str:
     parts = [p for p in folder_path.strip("/").split("/") if p]
     parent = "root"
-    # tolerate "My Drive/..."
     if parts and parts[0].strip().lower() in ("my drive", "mydrive", "root"):
         parts = parts[1:]
 
@@ -160,10 +161,10 @@ def open_sheet(gc, drive_service, spreadsheet_name: str, folder_path: str):
     except gspread.SpreadsheetNotFound:
         sh = gc.create(spreadsheet_name)
         created = True
-
     if created:
         ensure_sheet_in_folder(drive_service, sh, folder_path)
     return sh
+
 
 # =========================
 # PubMed HTTP (throttle + retry)
@@ -217,6 +218,7 @@ def make_http_get(
 
     return http_get
 
+
 # =========================
 # PubMed API helpers
 # =========================
@@ -245,6 +247,7 @@ def esummary(http_get, id_list: List[str]):
     params = {"db": "pubmed", "id": ",".join(id_list), "retmode": "json"}
     r = http_get(f"{BASE}/esummary.fcgi", params)
     return r.json()["result"]
+
 
 # =========================
 # Publication date parsing
@@ -320,6 +323,7 @@ def efetch_details_batched(http_get, pmids: List[str], batch_size=50):
             pubdates[pmid] = _norm_pub_date(y, m, d) if y else ""
 
     return abstracts, pubdates
+
 
 # =========================
 # Classification
@@ -425,20 +429,36 @@ def study_classification_multi(pubtypes: str, mesh_terms: str, abstract: str, ti
 
     return "; ".join(sorted(labels)) if labels else "Other"
 
+
 # =========================
-# Config loaders (Google Sheet: MOLECULES + SEARCH_RULES)
+# Config loaders
 # =========================
 def _truthy(x) -> bool:
     s = str(x).strip().lower()
     return s in ("true", "t", "1", "yes", "y")
 
-def load_molecules_and_rules(gc, config_sheet_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_molecules_and_rules_google(gc, config_sheet_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     sh = gc.open(config_sheet_name)
     mol_ws = sh.worksheet("MOLECULES")
     rules_ws = sh.worksheet("SEARCH_RULES")
-
     mol = pd.DataFrame(mol_ws.get_all_records())
     rules = pd.DataFrame(rules_ws.get_all_records())
+    return _normalize_config_frames(mol, rules)
+
+def load_molecules_and_rules_local(config_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    mol_path = os.path.join(config_dir, "MOLECULES.csv")
+    rules_path = os.path.join(config_dir, "SEARCH_RULES.csv")
+    if not os.path.exists(mol_path):
+        raise FileNotFoundError(f"Missing {mol_path}")
+    if not os.path.exists(rules_path):
+        raise FileNotFoundError(f"Missing {rules_path}")
+    mol = pd.read_csv(mol_path)
+    rules = pd.read_csv(rules_path)
+    return _normalize_config_frames(mol, rules)
+
+def _normalize_config_frames(mol: pd.DataFrame, rules: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    mol = mol.copy()
+    rules = rules.copy()
 
     mol["molecule_id"] = mol["molecule_id"].astype(str).str.strip()
     rules["molecule_id"] = rules["molecule_id"].astype(str).str.strip()
@@ -455,8 +475,9 @@ def load_molecules_and_rules(gc, config_sheet_name: str) -> Tuple[pd.DataFrame, 
     rules = rules[rules["molecule_id"].isin(mol_ids)].copy()
     return mol, rules
 
+
 # =========================
-# Sheet hardening
+# Google Sheets hardening
 # =========================
 def gs_call(fn, *args, max_retries=7, **kwargs):
     for attempt in range(1, max_retries + 1):
@@ -488,13 +509,11 @@ def open_or_prepare_tab(sh, tab_name: str, headers: List[str], rows_hint=2000, c
     tab_name = _safe_sheet_title(tab_name)
     if cols_hint is None:
         cols_hint = max(len(headers) + 2, 10)
-
     try:
         ws = sh.worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
         ws = gs_call(sh.add_worksheet, title=tab_name, rows=str(rows_hint), cols=str(cols_hint))
         gs_append_row(ws, headers)
-
     header = gs_call(ws.row_values, 1)
     if not header:
         gs_append_row(ws, headers)
@@ -505,6 +524,7 @@ def open_or_prepare_tab(sh, tab_name: str, headers: List[str], rows_hint=2000, c
 def chunked(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
+
 
 # =========================
 # Bucketing
@@ -528,6 +548,7 @@ def bucket_for_molecule_type(mol_type: str) -> str:
 
 def sheet_names_for_bucket(bucket: str) -> tuple[str, str]:
     return (f"{OUTPUT_BASE_NAME}_{bucket}_DATA", f"{OUTPUT_BASE_NAME}_{bucket}_TABS")
+
 
 # =========================
 # Query hash + row builder
@@ -576,6 +597,7 @@ def build_master_rows(uids, meta, abs_map, pubdate_map, molecule_id, rule_id, ma
         out.append(row)
     return out
 
+
 # =========================
 # Main runner
 # =========================
@@ -586,60 +608,31 @@ def main():
     creds, gc, drive_service = google_clients()
 
     has_real_key = bool(NCBI_API_KEY and len(NCBI_API_KEY.strip()) > 10)
-    MAX_REQ_PER_SEC = 4.0 if has_real_key else 2.0
+    max_rps = 4.0 if has_real_key else 2.0
 
     http_get = make_http_get(
         NCBI_TOOL=NCBI_TOOL,
         NCBI_EMAIL=NCBI_EMAIL,
         NCBI_API_KEY=NCBI_API_KEY,
-        MAX_REQ_PER_SEC=MAX_REQ_PER_SEC,
+        MAX_REQ_PER_SEC=max_rps,
         MAX_RETRIES=MAX_RETRIES,
         BACKOFF_BASE=BACKOFF_BASE,
         TIMEOUT_S=TIMEOUT_S,
     )
 
-    CONFIG_MODE = os.getenv("CONFIG_MODE", "google").strip().lower()  # google | local
-LOCAL_CONFIG_DIR = os.getenv("LOCAL_CONFIG_DIR", ".").strip()
-
-def load_molecules_and_rules_local(config_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    mol_path = os.path.join(config_dir, "MOLECULES.csv")
-    rules_path = os.path.join(config_dir, "SEARCH_RULES.csv")
-    if not os.path.exists(mol_path):
-        raise FileNotFoundError(f"Missing {mol_path}")
-    if not os.path.exists(rules_path):
-        raise FileNotFoundError(f"Missing {rules_path}")
-
-    mol = pd.read_csv(mol_path)
-    rules = pd.read_csv(rules_path)
-
-    mol["molecule_id"] = mol["molecule_id"].astype(str).str.strip()
-    rules["molecule_id"] = rules["molecule_id"].astype(str).str.strip()
-    rules["rule_id"] = rules["rule_id"].astype(str).str.strip()
-    rules["match_strength"] = rules["match_strength"].astype(str).str.strip().str.lower()
-    rules["query_string"] = rules["query_string"].astype(str).str.strip()
-
-    if "active" in mol.columns:
-        mol = mol[mol["active"].apply(_truthy)]
-    if "active" in rules.columns:
-        rules = rules[rules["active"].apply(_truthy)]
-
-    mol_ids = set(mol["molecule_id"].tolist())
-    rules = rules[rules["molecule_id"].isin(mol_ids)].copy()
-    return mol, rules
-
-if CONFIG_MODE == "local":
-    mol_df, rules_df = load_molecules_and_rules_local(LOCAL_CONFIG_DIR)
-else:
-    mol_df, rules_df = load_molecules_and_rules(gc, CONFIG_SHEET_NAME)
+    # --- Load config ---
+    if CONFIG_MODE == "local":
+        mol_df, rules_df = load_molecules_and_rules_local(LOCAL_CONFIG_DIR)
+    else:
+        mol_df, rules_df = load_molecules_and_rules_google(gc, CONFIG_SHEET_NAME)
 
     mol_type_map = {str(r.get("molecule_id","")).strip(): str(r.get("type","peptide")) for _, r in mol_df.iterrows()}
-
     buckets = ["PEPTIDE","SMALL_MOLECULE","MIXTURE"]
+
     out_data = {}
     out_tabs = {}
     out_seen = {}
 
-    # Local seen index (kept beside script execution)
     state_dir = os.path.join(os.getcwd(), "_state_pubmed_master")
     os.makedirs(state_dir, exist_ok=True)
 
@@ -668,9 +661,9 @@ else:
         sh_tabs = open_sheet(gc, drive_service, tabs_name, DRIVE_FOLDER_PATH)
 
         ws_master = open_or_prepare_tab(sh_data, TAB_MASTER, MASTER_COLUMNS, rows_hint=2000, cols_hint=max(len(MASTER_COLUMNS)+2,10))
+
         out_data[b] = (sh_data, ws_master)
         out_tabs[b] = sh_tabs
-
         out_seen[b] = load_seen(data_name)
 
         # Pre-create molecule tabs
@@ -695,7 +688,6 @@ else:
         sh_tabs = out_tabs[bucket]
         data_sheet_name = sh_data.title
         seen = out_seen[bucket]
-
         qhash = query_hash12(query)
 
         # BACKFILL
@@ -721,6 +713,7 @@ else:
                         abs_map, pubdate_map = efetch_details_batched(http_get, uids, batch_size=EFETCH_BATCH)
 
                         rows = build_master_rows(uids, meta, abs_map, pubdate_map, molecule_id, rule_id, match_strength, qhash)
+
                         rows2 = []
                         for row in rows:
                             k = (row[0], row[1], row[2])
@@ -758,6 +751,7 @@ else:
                     abs_map, pubdate_map = efetch_details_batched(http_get, uids, batch_size=EFETCH_BATCH)
 
                     rows = build_master_rows(uids, meta, abs_map, pubdate_map, molecule_id, rule_id, match_strength, qhash)
+
                     rows2 = []
                     for row in rows:
                         k = (row[0], row[1], row[2])
@@ -780,6 +774,7 @@ else:
         save_seen(data_sheet_name, seen)
 
     print(f"✅ DONE. Total rows added across outputs: {total_added}")
+
 
 if __name__ == "__main__":
     main()
